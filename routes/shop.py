@@ -1,10 +1,21 @@
-from flask import Blueprint, render_template, redirect, url_for, flash, request
+from flask import Blueprint, render_template, redirect, url_for, flash, request, jsonify
 from models import Product, CartItem, Order, OrderItem
 from database import db
 from flask_login import current_user, login_required
 from forms import AddToCartForm, CheckoutForm
+from chatbot_integration.chatbot_service import ChatbotService
 
 shop_bp = Blueprint('shop', __name__, template_folder='../templates')
+
+# Lazy singleton for chatbot service to avoid raising at import time if env missing
+_chatbot_service = None
+
+
+def get_chatbot_service() -> ChatbotService:
+    global _chatbot_service
+    if _chatbot_service is None:
+        _chatbot_service = ChatbotService()
+    return _chatbot_service
 
 def get_products_from_db():
     """
@@ -23,6 +34,98 @@ def get_products_from_db():
     except Exception as e:
         print(f"Error fetching products from DB: {e}")
         return "I was unable to access the product catalog."
+
+def get_products_list():
+    """
+    Retrieve product list from the database in structured format.
+    Returns a list of product objects containing all required fields.
+    """
+    try:
+        products = Product.query.all()
+        products_list = []
+        
+        for product in products:
+            products_list.append({
+                'id': product.id,
+                'name': product.name,
+                'description': product.description if hasattr(product, 'description') else '',
+                'price': float(product.price),
+                'stock': product.stock
+            })
+        
+        return products_list
+    except Exception as e:
+        print(f"Error while fetching products from DB: {e}")
+        return []
+
+@shop_bp.route('/chatbot', methods=['POST'])
+def chatbot():
+    """
+    Chatbot endpoint that handles user messages and returns the AI response.
+
+    Expects JSON with:
+    - message: user message (string)
+    - chat_history: conversation history (list, optional)
+
+    Returns JSON with:
+    - response: chatbot reply (string)
+    - success: whether the request succeeded (boolean)
+    - error: error message if the request failed (string, optional)
+    """
+    try:
+        # Receive data from the request
+        data = request.get_json()
+        
+        # Validate that a message was provided
+        if not data or 'message' not in data:
+            return jsonify({
+                'response': 'Please send a valid message.',
+                'success': False,
+                'error': 'No message received'
+            }), 400
+        
+        user_message = data.get('message', '').strip()
+        chat_history = data.get('chat_history', [])
+        
+        # Check that the message is not empty
+        if not user_message:
+            return jsonify({
+                'response': 'Please enter a message.',
+                'success': False,
+                'error': 'Empty message'
+            }), 400
+        
+        # Get structured product list from the database
+        products = get_products_list()
+
+        # Validate and limit chat_history to prevent malicious payloads
+        if not isinstance(chat_history, list):
+            chat_history = []
+        # Only accept simple dicts with role and content
+        sanitized_history = []
+        for item in chat_history[-12:]:
+            if isinstance(item, dict) and 'role' in item and 'content' in item:
+                sanitized_history.append({'role': str(item['role']), 'content': str(item['content'])})
+
+        # Retrieve (lazy) chatbot service and call it
+        chatbot_service = get_chatbot_service()
+        response = chatbot_service.get_chatbot_response_with_products(
+            user_message=user_message,
+            chat_history=sanitized_history,
+            products=products
+        )
+        
+        # Return the chatbot response as JSON
+        return jsonify(response), 200
+        
+    except Exception as e:
+        # Error handling
+        print(f"Error /chatbot endpoint: {str(e)}")
+        return jsonify({
+            'response': 'Sorry, a server error occurred. Please try again.',
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @shop_bp.route('/shop')
 def product_list():
