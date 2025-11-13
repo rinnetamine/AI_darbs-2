@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 from typing import List, Dict, Optional
@@ -35,6 +36,18 @@ class ChatbotService:
     DEFAULT_MODEL = os.getenv("HUGGINGFACE_MODEL", "katanemo/Arch-Router-1.5B")
     MAX_HISTORY = 12  # keep last N messages to avoid very long payloads
     PRODUCT_LIMIT = 30
+    # Keywords used for simple on-topic heuristics. If neither the user message
+    # nor model response contain any of these, we treat the exchange as off-topic.
+    STORE_KEYWORDS = {
+        'product', 'price', 'order', 'purchase', 'cart', 'shipping', 'return', 'refund',
+        'stock', 'availability', 'checkout', 'payment', 'invoice', 'sku', 'item', 'buy',
+        'size', 'color', 'brand', 'search', 'recommend', 'recommendation', 'category',
+        'delivery', 'warranty', 'tracking', 'billing', 'catalog'
+    }
+    REDIRECT_MESSAGE = (
+        "I'm sorry, I can only help with questions related to this shop and its products. "
+        "Please ask about products, availability, prices, orders, shipping, returns, or similar shop topics."
+    )
 
     def __init__(self, token: Optional[str] = None):
         load_dotenv()
@@ -48,18 +61,21 @@ class ChatbotService:
 
         self.model = self.DEFAULT_MODEL
 
-        # System instruction for the model. Keep it explicit and human-readable
-        # so it is easy to edit later.
+        # System instruction for the model. Be explicit and strict: always refuse
+        # off-topic requests and redirect to shop-related topics. This instruction
+        # is intentionally prescriptive to minimize off-topic responses.
         self.system_instruction = (
             "You are a professional e-shop assistant. Your ONLY purpose is to help customers with:\n"
             "- Product information and search\n"
             "- Answering questions about available products\n"
             "- Recommendations based on customer needs\n"
-            "- Help with orders and purchasing\n\n"
+            "- Help with orders, purchasing, shipping, returns, and billing\n\n"
             "STRICT RULES:\n"
-            "- ONLY answer questions related to the e-shop and its products.\n"
-            "- DO NOT tell jokes, provide general knowledge, or discuss topics outside the shop.\n"
-            "- ALWAYS redirect customers back to shop-related topics in a polite manner.\n"
+            "- ONLY answer questions that are directly related to this e-shop and its products.\n"
+            "- If a user asks anything outside the shop (personal advice, general knowledge, politics, etc.),\n"
+            "  respond ONLY with a brief refusal and redirect them back to shop topics.\n"
+            "- Do NOT provide jokes, opinions unrelated to products, or external factual summaries.\n"
+            "- When refusing, use a short, polite redirection such as: 'I'm sorry, I can only help with questions related to this shop and its products...'\n"
         )
 
     # Removed off-topic detection and related keyword rules as requested.
@@ -81,6 +97,21 @@ class ChatbotService:
                 # fallback, keep parsing resilient
                 sanitized.append({'name': 'N/A', 'description': '', 'price': 0.0, 'stock': 0})
         return sanitized
+
+    def _is_store_related(self, text: Optional[str]) -> bool:
+        """Simple heuristic to check whether `text` is about the store or products.
+
+        This is intentionally conservative: if no store-related keyword appears
+        we treat the text as off-topic.
+        """
+        if not text:
+            return False
+        text_l = text.lower()
+        # compile regex once per instance for performance
+        if not hasattr(self, "_store_kw_re"):
+            pattern = r"\\b(" + "|".join(re.escape(k) for k in sorted(self.STORE_KEYWORDS)) + r")\\b"
+            self._store_kw_re = re.compile(pattern)
+        return bool(self._store_kw_re.search(text_l))
 
     def _build_messages(self, user_message: str, chat_history: List[Dict], products: Optional[List[Dict]] = None) -> List[Dict]:
         # trim history to last MAX_HISTORY messages
@@ -117,6 +148,12 @@ class ChatbotService:
             if response and getattr(response, 'choices', None) and len(response.choices) > 0:
                 # compatible with HF response shape used previously
                 response_text = response.choices[0].message.content.strip()
+                # enforce on-topic policy: if neither the user query nor the model
+                # response looks shop-related, return a redirect message instead.
+                if not (self._is_store_related(user_message) or self._is_store_related(response_text)):
+                    logger.info('Detected off-topic exchange; returning redirect message')
+                    return {'response': self.REDIRECT_MESSAGE, 'success': True, 'redirected': True}
+
                 return {'response': response_text, 'success': True}
 
             return {'response': "Sorry, I couldn't generate a response. Please try again.", 'success': False, 'error': 'No response from API'}
@@ -134,6 +171,10 @@ class ChatbotService:
 
             if response and getattr(response, 'choices', None) and len(response.choices) > 0:
                 response_text = response.choices[0].message.content.strip()
+                if not (self._is_store_related(user_message) or self._is_store_related(response_text)):
+                    logger.info('Detected off-topic exchange with products; returning redirect message')
+                    return {'response': self.REDIRECT_MESSAGE, 'success': True, 'redirected': True}
+
                 return {'response': response_text, 'success': True}
 
             return {'response': "Sorry, I couldn't generate a response. Please try again.", 'success': False, 'error': 'No response from API'}
